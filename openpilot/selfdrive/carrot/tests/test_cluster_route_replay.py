@@ -8,12 +8,15 @@ CLUSTER_DIR = Path(__file__).resolve().parents[1] / "cluster"
 sys.path.insert(0, str(CLUSTER_DIR))
 
 from cluster_live import OpenpilotLiveSource
-from cluster_models import ModelPathPoint
+from cluster_models import ClusterAlert, ModelPathPoint
 from cluster_route_replay import (
   RawCornerObject,
   RouteLogParser,
+  StableCornerObjectTracker,
   adjacent_route_log_path,
   blend_frames,
+  car_state_corner_detections,
+  corner_track_label,
   frame_to_state,
   model_lead_detections_from_model_v2,
 )
@@ -48,6 +51,36 @@ def radar_lead(track_id, d_rel=25.0, y_rel=2.0):
   )
 
 
+def test_blindspot_flags_do_not_create_virtual_corner_vehicles():
+  detections = car_state_corner_detections(SimpleNamespace(
+    leftBlindspot=True,
+    rightBlindspot=True,
+  ))
+
+  assert detections == ()
+
+
+def test_blindspot_rear_distance_still_creates_measured_corner_vehicle():
+  detections = car_state_corner_detections(SimpleNamespace(
+    leftBlindspot=True,
+    rightBlindspot=False,
+    leftRearLongDist=3.2,
+    leftRearLatDist=2.4,
+  ))
+
+  assert len(detections) == 1
+  assert detections[0].label == "LR"
+  assert detections[0].longitudinal_m == -3.2
+  assert detections[0].lateral_m == -2.4
+  assert detections[0].source == "carState"
+
+
+def test_corner_430_track_labels_preserve_radar_group():
+  assert corner_track_label(300, "corner430") == "CR430_000"
+  assert corner_track_label(411, "corner430") == "CR430_111"
+  assert corner_track_label(1204, "corner430") == "CR430_T1204"
+
+
 def test_replay_uses_raw_object_identity_when_corner_slot_is_reused():
   parser = RouteLogParser()
   old_object = corner_object(13.969, 2, 108, 255, 3.6, -4.65, -4.10, -0.20)
@@ -71,6 +104,40 @@ def test_replay_uses_raw_object_identity_when_corner_slot_is_reused():
   )))
 
   assert moved_track_id == new_track_id
+
+
+def test_reconstructed_corner_tracks_include_filtered_lead_dynamics():
+  tracker = StableCornerObjectTracker()
+  output = ()
+  for index in range(14):
+    t = index * 0.05
+    vx = index * 0.08
+    tracker.update(corner_object(t, 1, 46, index + 1, 12.0 + vx * t, 2.0, vx, 0.0))
+    output = tracker.live_tracks_at(t, 15.0)
+
+  assert len(output) == 1
+  assert output[0].aLead > 0.05
+  assert output[0].jLead != 0.0
+
+
+def test_reconstructed_live_tracks_can_reject_stale_measurements():
+  tracker = StableCornerObjectTracker()
+  for index in range(4):
+    tracker.update(corner_object(
+      1.0 + index * 0.02,
+      1,
+      46,
+      index + 1,
+      12.0,
+      2.0,
+      1.0,
+      -1.0,
+    ))
+
+  assert tracker.live_tracks_at(1.08, 15.0, max_measurement_age_s=0.10)
+  assert not tracker.live_tracks_at(
+    1.20, 15.0, max_measurement_age_s=0.10,
+  )
 
 
 def test_recorded_cutin_display_requires_current_leads_cutin_membership():
@@ -177,6 +244,43 @@ def test_live_selfdrive_state_passes_event_timestamp():
   source._apply_service_update("selfdriveState", 12.5)
 
   assert calls == [(source.sm["selfdriveState"], 12.5)]
+
+
+def test_selfdrive_alert_reaches_cluster_state_and_clears() -> None:
+  parser = RouteLogParser()
+  parser._update_selfdrive_state(SimpleNamespace(
+    enabled=True,
+    alertText1="TAKE CONTROL IMMEDIATELY",
+    alertText2="Camera Malfunction",
+    alertSize=SimpleNamespace(raw=3),
+    alertStatus=SimpleNamespace(raw=2),
+    alertType="cameraMalfunction/immediateDisable",
+    alertSound="warningImmediate",
+  ), 1.0)
+
+  frame = parser._frame_from_car_state(SimpleNamespace(), 1.01)
+  assert frame.alert == ClusterAlert(
+    text1="TAKE CONTROL IMMEDIATELY",
+    text2="Camera Malfunction",
+    size=3,
+    status=2,
+    alert_type="cameraMalfunction/immediateDisable",
+  )
+  assert frame_to_state(frame).alert == frame.alert
+
+  parser._update_selfdrive_state(SimpleNamespace(alertSize="none"), 1.02)
+  assert parser._frame_from_car_state(SimpleNamespace(), 1.03).alert is None
+
+
+def test_selfdrive_alert_is_discrete_during_replay_interpolation() -> None:
+  parser = RouteLogParser()
+  base = parser._frame_from_car_state(SimpleNamespace(), 0.0)
+  alert = ClusterAlert("Steering Unavailable", "Take Control", size=2, status=1)
+  alerted = replace(base, t=0.0, alert=alert)
+  cleared = replace(base, t=1.0, alert=None)
+
+  assert blend_frames(alerted, cleared, 0.49).alert == alert
+  assert blend_frames(alerted, cleared, 0.50).alert is None
 
 
 def test_live_longitudinal_plan_passes_service_validity():

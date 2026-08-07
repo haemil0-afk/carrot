@@ -1,6 +1,9 @@
 "use strict";
 
+import { dashcamReadStateStore } from "./dashcam_player_session.js";
+import { createLogsSegmentStatusTag } from "./player/components.js";
 import { loadScreenrecordVideos } from "./screenrecord.js";
+import { openRouteSummary } from "./route_summary/index.js";
 import {
   formatLogBytes,
   formatRelativeEpoch,
@@ -17,6 +20,11 @@ import {
   syncLogsMenu,
   unobserveLogsLazyImages,
 } from "./runtime.js";
+import {
+  createDashcamUploadProgressModel,
+  dashcamUploadProgressState,
+} from "./upload_progress.js";
+import { dashcamUploadStats } from "./upload_summary.js";
 
 // Logs page — Dashcam tab.
 // Route + segment virtual listing, FFmpeg thumb/preview lazy load,
@@ -33,8 +41,15 @@ const DASHCAM_SEGMENT_SECONDS = 60;
 const DASHCAM_REPLAY_TIME_TOLERANCE_SECONDS = 120;
 const DASHCAM_LOAD_AHEAD_VIEWPORTS = 1.5;
 const DASHCAM_ROUTE_WINDOW_OVERSCAN_VIEWPORTS = 1.25;
+const DASHCAM_UPLOAD_POLL_INTERVAL_MS = 160;
+const DASHCAM_UPLOAD_PROGRESS_MIN_VISIBLE_MS = 800;
+const DASHCAM_UPLOAD_PROGRESS_FINISH_HOLD_MS = 240;
+const DASHCAM_UPLOAD_RESULT_VISIBLE_LIMIT = 5;
 let dashcamUploadActiveJobId = null;
 let dashcamUploadResumePromise = null;
+let dashcamReadStateLoadPromise = null;
+let dashcamReadStateWritePromise = Promise.resolve();
+let dashcamReadStateInteracted = false;
 
 const dashcamState = {
   initialized: false,
@@ -470,6 +485,51 @@ function formatDashcamTimeRange(startEpoch, endEpoch, options = {}) {
     : `${start.date} ${start.time} – ${end.date} ${end.time}`;
 }
 
+function dashcamPlayerGroup(entry, route) {
+  const start = dashcamDateParts(entry?.routeStartEpoch);
+  const end = dashcamDateParts(entry?.routeEndEpoch);
+  const sameDate = start && end && start.date === end.date;
+  return {
+    route,
+    title: entry?.title || dashcamRouteTitle(route),
+    dateLabel: sameDate ? start.date : "",
+    timeRange: start && end
+      ? (sameDate ? `${start.time} – ${end.time}` : `${start.date} ${start.time} – ${end.date} ${end.time}`)
+      : String(entry?.dateLabel || ""),
+    segmentCount: dashcamSegmentCountForRoute(entry),
+  };
+}
+
+function dashcamPlayerSegmentTimeLabel(entry, segment) {
+  const time = dashcamSegmentTime(entry, segment);
+  const start = dashcamDateParts(time?.startEpoch);
+  const end = dashcamDateParts(time?.endEpoch);
+  if (start && end) {
+    return start.date === end.date
+      ? `${start.time}–${end.time}`
+      : `${start.date} ${start.time}–${end.date} ${end.time}`;
+  }
+  return formatDashcamSegmentTimeLabel(entry, segment);
+}
+
+function dashcamPlayerSegment(entry, route, segment) {
+  const segmentIndex = dashcamSegmentIndex(segment);
+  const time = dashcamSegmentTime(entry, segment);
+  return Object.freeze({
+    id: segment,
+    name: `${getUIText("segment_label", "Segment")} ${segmentIndex}`,
+    timeLabel: dashcamPlayerSegmentTimeLabel(entry, segment),
+    title: `${dashcamRouteTitle(route)} · ${getUIText("segment_label", "Segment")} ${segmentIndex}`,
+    subtitle: formatDashcamTimeRange(time?.startEpoch, time?.endEpoch),
+    src: dashcamApiPath("video", segment),
+    thumbnailSrc: dashcamApiPath("thumbnail", segment),
+  });
+}
+
+function dashcamPlayerSegments(entry, route, segments) {
+  return (segments || []).map((segment) => dashcamPlayerSegment(entry, route, segment));
+}
+
 function dashcamSegmentTime(entry, segment) {
   const value = entry?.segmentTimes?.[segment];
   return value && typeof value === "object" ? value : null;
@@ -603,6 +663,78 @@ function dashcamSelectedForRoute(entry) {
   return dashcamSegmentsForRoute(entry).filter((segment) => dashcamState.selected.has(segment));
 }
 
+function dashcamSegmentReadStatusTag(segment) {
+  return createLogsSegmentStatusTag(
+    dashcamReadStateStore.statusFor(segment),
+    {
+      reading: getUIText("segment_reading", "Reading"),
+      recent: getUIText("segment_recently_read", "Recently viewed"),
+    },
+  );
+}
+
+function dashcamSegmentReadStatusHtml(segment) {
+  return dashcamSegmentReadStatusTag(segment)?.outerHTML || "";
+}
+
+function syncDashcamSegmentReadStatusUi() {
+  const host = document.getElementById("dashcamRoutes");
+  if (!host) return;
+  host.querySelectorAll(".dashcam-segment-tile[data-segment]").forEach((tile) => {
+    const statusHost = tile.querySelector(".dashcam-segment-read-status");
+    if (!statusHost) return;
+    const tag = dashcamSegmentReadStatusTag(tile.dataset.segment);
+    statusHost.replaceChildren(...(tag ? [tag] : []));
+    statusHost.hidden = !tag;
+  });
+}
+
+function persistDashcamRecentSegment(segment) {
+  const recentSegment = String(segment || "").trim();
+  if (!recentSegment) return Promise.resolve(null);
+  const write = dashcamReadStateWritePromise
+    .catch(() => null)
+    .then(() => postJson("/api/dashcam/read-state", { recentSegment }));
+  dashcamReadStateWritePromise = write;
+  return write;
+}
+
+function selectDashcamReadSegment(segment) {
+  dashcamReadStateInteracted = true;
+  const before = dashcamReadStateStore.snapshot();
+  const result = dashcamReadStateStore.select(segment);
+  const recentSegment = result.state.previousSegment;
+  if (
+    result.changed
+    && recentSegment
+    && recentSegment !== before.previousSegment
+  ) {
+    persistDashcamRecentSegment(recentSegment).catch(() => {});
+  }
+  return result;
+}
+
+function finishDashcamReadSegment() {
+  const result = dashcamReadStateStore.finish();
+  if (result.changed && result.state.previousSegment) {
+    persistDashcamRecentSegment(result.state.previousSegment).catch(() => {});
+  }
+  return result;
+}
+
+function loadDashcamReadState() {
+  if (dashcamReadStateLoadPromise) return dashcamReadStateLoadPromise;
+  dashcamReadStateLoadPromise = getJson("/api/dashcam/read-state")
+    .then((response) => {
+      if (!dashcamReadStateInteracted) {
+        dashcamReadStateStore.restoreRecent(response?.recentSegment);
+      }
+      return dashcamReadStateStore.snapshot();
+    })
+    .catch(() => dashcamReadStateStore.snapshot());
+  return dashcamReadStateLoadPromise;
+}
+
 function dashcamSegmentTileHtml(route, segment, segmentIndex, options = {}) {
   const entry = options.entry || (dashcamState.routes || []).find((item) => item.route === route);
   const compactSegments = options.compact === true;
@@ -610,6 +742,7 @@ function dashcamSegmentTileHtml(route, segment, segmentIndex, options = {}) {
   const routeAttr = escapeHtml(route);
   const segAttr = escapeHtml(segment);
   const timeLabel = escapeHtml(formatDashcamSegmentTimeLabel(entry, segment));
+  const readStatus = dashcamSegmentReadStatusHtml(segment);
   const checked = dashcamState.selected.has(segment) ? " checked" : "";
   const tileClass = [
     "dashcam-segment-tile",
@@ -626,7 +759,10 @@ function dashcamSegmentTileHtml(route, segment, segmentIndex, options = {}) {
       </label>
     </div>
     <div class="dashcam-segment-body">
-      <div class="dashcam-segment-badge">${timeLabel}</div>
+      <div class="dashcam-segment-topline">
+        <div class="dashcam-segment-badge">${timeLabel}</div>
+        <span class="dashcam-segment-read-status"${readStatus ? "" : " hidden"}>${readStatus}</span>
+      </div>
       <div class="dashcam-segment-name">${segAttr}</div>
     </div>
     <button class="dashcam-menu-btn" type="button" data-action="segment-menu" data-route="${routeAttr}" data-segment="${segAttr}" aria-label="${escapeHtml(getUIText("segment_menu", "Segment menu"))}" title="${escapeHtml(getUIText("segment_menu", "Segment menu"))}">
@@ -700,10 +836,6 @@ function dashcamRouteCardHtml(entry, index = 0, options = {}) {
           <div class="dashcam-route-title">${title}</div>
           <div class="dashcam-route-subtitle">${dateLabel}</div>
         </div>
-        <button class="smallBtn dashcam-report-btn" type="button" data-action="route-report" data-route="${routeAttr}" title="${escapeHtml(getUIText("route_report", "주행 리포트"))}">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M5 3h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2m2 12h2v3H7zm4-6h2v9h-2zm4 3h2v6h-2z"/></svg>
-          <span>${escapeHtml(getUIText("route_report", "주행 리포트"))}</span>
-        </button>
         <button class="dashcam-expand-btn" type="button" data-action="toggle-route" data-route="${routeAttr}" aria-expanded="${expanded ? "true" : "false"}" title="${escapeHtml(expanded ? getUIText("collapse", "Collapse") : getUIText("show_segments", "Show segments"))}">
           <svg viewBox="0 0 24 24"><path fill="currentColor" d="${expanded ? "M7.41 15.41 12 10.83l4.59 4.58L18 14l-6-6-6 6z" : "M7.41 8.59 12 13.17l4.59-4.58L18 10l-6 6-6-6z"}"/></svg>
         </button>
@@ -711,13 +843,9 @@ function dashcamRouteCardHtml(entry, index = 0, options = {}) {
       <div class="dashcam-segments ${expanded ? "" : "is-collapsed"}">
         <div class="dashcam-selection-row">
           <span class="dashcam-selection-count">${escapeHtml(getUIText("selected_count", "{count} selected", { count: selected.length }))}</span>
-          <button class="smallBtn dashcam-report-btn dashcam-report-btn--row" type="button" data-action="route-report" data-route="${routeAttr}" title="${escapeHtml(getUIText("route_report", "주행 리포트"))}">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M5 3h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2m2 12h2v3H7zm4-6h2v9h-2zm4 3h2v6h-2z"/></svg>
-            <span>${escapeHtml(getUIText("route_report", "주행 리포트"))}</span>
-          </button>
           <button class="smallBtn" type="button" data-action="select-route" data-route="${routeAttr}" data-selected="${allSelected ? "1" : "0"}">${escapeHtml(selectLabel)}</button>
           <button class="smallBtn btn--filled" type="button" data-action="upload-selected" data-route="${routeAttr}" ${selected.length ? "" : "disabled"}>${escapeHtml(getUIText("upload_selected", "Upload selected"))}</button>
-          <button class="smallBtn dashcam-group-menu-btn" type="button" data-action="route-menu" data-route="${routeAttr}" aria-label="${escapeHtml(getUIText("group_menu", "Group menu"))}" title="${escapeHtml(getUIText("group_menu", "Group menu"))}">
+          <button class="smallBtn dashcam-group-menu-btn dashcam-group-menu-btn--row" type="button" data-action="route-menu" data-route="${routeAttr}" aria-label="${escapeHtml(getUIText("group_menu", "Group menu"))}" title="${escapeHtml(getUIText("group_menu", "Group menu"))}">
             <svg viewBox="0 0 24 24"><path fill="currentColor" d="M6 10c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2m12 0c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2m-6 0c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2"/></svg>
           </button>
         </div>
@@ -1046,30 +1174,54 @@ function markDashcamScrollBusy(options = {}) {
 
 function openDashcamPlayer(route, segment) {
   const entry = (dashcamState.routes || []).find((item) => item.route === route);
+  const orderedSegments = mergeDashcamSegments(dashcamSegmentsForRoute(entry), [], "asc");
+  const readState = selectDashcamReadSegment(segment).state;
   const time = dashcamSegmentTime(entry, segment);
   const endEpoch = Number(time?.endEpoch || 0);
   const initialSubtitle = formatDashcamTimeRange(time?.startEpoch, endEpoch);
-  openLogsVideoPlayer(
-    `${dashcamRouteTitle(route)} · Segment ${dashcamSegmentIndex(segment)}`,
+  const playerController = openLogsVideoPlayer(
+    `${dashcamRouteTitle(route)} · ${getUIText("segment_label", "Segment")} ${dashcamSegmentIndex(segment)}`,
     dashcamApiPath("video", segment),
     {
       kind: "dashcam",
+      currentGroup: dashcamPlayerGroup(entry, route),
+      segments: dashcamPlayerSegments(entry, route, orderedSegments),
+      activeSegment: segment,
+      previousSegment: readState.previousSegment,
       subtitle: initialSubtitle,
-      subtitleForDuration: (duration) => {
+      subtitleForSegmentDuration: (target, duration) => {
+        const targetTime = dashcamSegmentTime(entry, target);
+        const targetEndEpoch = Number(targetTime?.endEpoch || 0);
+        const targetSubtitle = formatDashcamTimeRange(targetTime?.startEpoch, targetEndEpoch);
         const seconds = Number(duration || 0);
-        if (!Number.isFinite(seconds) || seconds <= 0 || endEpoch <= 0) return initialSubtitle;
-        return formatDashcamTimeRange(endEpoch - seconds, endEpoch);
+        if (!Number.isFinite(seconds) || seconds <= 0 || targetEndEpoch <= 0) return targetSubtitle;
+        return formatDashcamTimeRange(targetEndEpoch - seconds, targetEndEpoch);
       },
-      onSend: () => uploadDashcamSegments([segment], {
-        confirm: false,
-        showProgress: false,
-        showResult: false,
-        toastDuration: 2600,
+      onSegmentSend: (target) => uploadDashcamSegments([target], {
+        showProgress: true,
+        showResult: true,
+        showSuccessToast: false,
       }),
-      onMenu: ({ close } = {}) => showDashcamSegmentMenu(route, segment, { activePlayerClose: close }),
+      onSegmentMenu: (target, { close } = {}) => {
+        return showDashcamSegmentMenu(route, target, { activePlayerClose: close });
+      },
+      onSegmentChange: (target) => {
+        selectDashcamReadSegment(target);
+      },
+      onClose: () => {
+        finishDashcamReadSegment();
+      },
     },
   );
+  fetchAllDashcamSegmentNames(route).then((allSegments) => {
+    if (!playerController?.isOpen?.()) return;
+    const currentEntry = (dashcamState.routes || []).find((item) => item.route === route) || entry;
+    const completeSegments = mergeDashcamSegments(allSegments, orderedSegments, "asc");
+    playerController.updateSegments?.(dashcamPlayerSegments(currentEntry, route, completeSegments));
+  }).catch(() => {});
 }
+
+dashcamReadStateStore.subscribe(syncDashcamSegmentReadStatusUi);
 
 async function openDashcamDriveReplay(route, segment) {
   const requestId = ++dashcamState.replayLoadSeq;
@@ -1095,18 +1247,6 @@ async function openDashcamDriveReplay(route, segment) {
   await startPromise;
 }
 
-function dashcamUploadStats(items) {
-  const list = Array.isArray(items) ? items : [];
-  return list.reduce((stats, item) => {
-    const files = Array.isArray(item?.files) ? item.files : [];
-    const totalSize = Number(item?.totalSize) || files.reduce((sum, file) => sum + (Number(file?.size) || 0), 0);
-    stats.segments += 1;
-    stats.files += files.length;
-    stats.bytes += totalSize;
-    return stats;
-  }, { segments: 0, files: 0, bytes: 0 });
-}
-
 function dashcamUploadSummaryLabel(stats) {
   const fileCount = Number(stats?.files || 0);
   const bytes = Number(stats?.bytes || 0);
@@ -1117,15 +1257,82 @@ function dashcamUploadSummaryLabel(stats) {
   return `${fileLabel} · ${sizeLabel}`;
 }
 
-function dashcamUploadResultHtml(result) {
-  const text = String(result?.shareText || result?.message || "");
-  const stats = dashcamUploadStats(result?.results || []);
-  return `<div class="dashcam-share-card">
-    <div class="dashcam-share-card__summary">
-      <span>${escapeHtml(getUIText("upload_count", "Upload {uploaded}/{total}", { uploaded: Number(result?.uploaded || 0), total: Number(result?.total || 0) }))}</span>
-      <span>${escapeHtml(dashcamUploadSummaryLabel(stats))}</span>
+function dashcamUploadConfirmHtml(stats) {
+  const segmentCountLabel = getUIText("upload_segment_count", "{count} segments", {
+    count: Number(stats?.segments || 0),
+  });
+  const qcameraLabel = getUIText("upload_kind_count", "{name} {count}", {
+    name: "qcamera",
+    count: Number(stats?.qcamera || 0),
+  });
+  const rlogLabel = getUIText("upload_kind_count", "{name} {count}", {
+    name: "rlog",
+    count: Number(stats?.rlog || 0),
+  });
+  const totalCountLabel = getUIText("upload_total_count", "{count} files total", {
+    count: Number(stats?.files || 0),
+  });
+  const bytes = Number(stats?.bytes || 0);
+  const sizeLabel = bytes > 0 ? formatLogBytes(bytes) : getUIText("upload_size_unknown", "size unknown");
+  return `<section class="app-dialog__uploadBrief" aria-label="${escapeHtml(getUIText("upload_summary_label", "Upload summary"))}">
+    <div class="app-dialog__uploadBriefCopy">
+      <strong class="app-dialog__uploadBriefTitle">${escapeHtml(segmentCountLabel)}</strong>
+      <span class="app-dialog__uploadBriefKinds">${escapeHtml(`${qcameraLabel} · ${rlogLabel}`)}</span>
     </div>
-    <pre>${escapeHtml(text)}</pre>
+    <div class="app-dialog__uploadBriefAmount">
+      <strong>${escapeHtml(sizeLabel)}</strong>
+      <span>${escapeHtml(totalCountLabel)}</span>
+    </div>
+  </section>`;
+}
+
+function dashcamUploadResultHtml(result) {
+  const results = Array.isArray(result?.results) ? result.results : [];
+  const stats = dashcamUploadStats(results);
+  const failedResults = results.filter((item) => item?.ok !== true);
+  const visibleResults = results.length <= DASHCAM_UPLOAD_RESULT_VISIBLE_LIMIT
+    ? results
+    : failedResults.slice(0, DASHCAM_UPLOAD_RESULT_VISIBLE_LIMIT);
+  const hiddenFailureCount = Math.max(0, failedResults.length - visibleResults.length);
+  const segmentRows = visibleResults
+    .map((item) => {
+      const ok = item?.ok === true;
+      const status = ok
+        ? getUIText("upload_status_complete", "Complete")
+        : getUIText("upload_status_failed", "Failed");
+      return `<div class="app-dialog__metaResult">
+        <code class="app-dialog__metaCode">${escapeHtml(String(item?.segment || ""))}</code>
+        <span class="app-dialog__metaState" data-tone="${ok ? "success" : "error"}">${escapeHtml(status)}</span>
+      </div>`;
+    })
+    .join("");
+  const overflowRow = hiddenFailureCount > 0
+    ? `<div class="app-dialog__metaOverflow">${escapeHtml(getUIText("upload_more_failed", "{count} more failed", {
+      count: hiddenFailureCount,
+    }))}</div>`
+    : "";
+  const resultList = segmentRows || overflowRow
+    ? `<div class="app-dialog__metaResultList">${segmentRows}${overflowRow}</div>`
+    : "";
+  const qcameraLabel = getUIText("upload_kind_count", "{name} {count}", {
+    name: "qcamera",
+    count: Number(stats.qcamera || 0),
+  });
+  const rlogLabel = getUIText("upload_kind_count", "{name} {count}", {
+    name: "rlog",
+    count: Number(stats.rlog || 0),
+  });
+  return `<div class="app-dialog__metaList">
+    <div class="app-dialog__metaLine">${escapeHtml(getUIText("upload_complete_count", "Upload complete {uploaded}/{total}", {
+      uploaded: Number(result?.uploaded || 0),
+      total: Number(result?.total || 0),
+    }))}</div>
+    ${resultList}
+    <div class="app-dialog__metaSummary">
+      <span>${escapeHtml(qcameraLabel)}</span>
+      <span>${escapeHtml(rlogLabel)}</span>
+      <strong>${escapeHtml(dashcamUploadSummaryLabel(stats))}</strong>
+    </div>
   </div>`;
 }
 
@@ -1135,7 +1342,7 @@ async function showDashcamUploadResult(result) {
     mode: "choice",
     title: getUIText("log_upload_result", "Upload Result"),
     html: true,
-    messageHtml: `<div class="dashcam-share-dialog">${dashcamUploadResultHtml(result)}</div>`,
+    messageHtml: dashcamUploadResultHtml(result),
     cancelLabel: getUIText("close", "Close"),
     copyText: text,
     copyLabel: getUIText("copy", "Copy"),
@@ -1157,82 +1364,121 @@ async function cancelDashcamUploadJob(jobId) {
   return postJson("/api/dashcam/upload/cancel", { id: jobId });
 }
 
-function openDashcamUploadProgress(total, stats = null, options = {}) {
-  const overlay = document.createElement("div");
-  overlay.className = "dashcam-upload-progress";
-  overlay.innerHTML = `<div class="dashcam-upload-progress__sheet" role="dialog" aria-modal="true">
-    <div class="dashcam-upload-progress__title">${escapeHtml(getUIText("log_uploading", "Uploading logs"))}</div>
-    <div class="dashcam-upload-progress__message">0/${Number(total || 0)}</div>
-    <div class="dashcam-upload-progress__bar" aria-hidden="true"><span></span></div>
-    <div class="dashcam-upload-progress__summary">${escapeHtml(stats ? dashcamUploadSummaryLabel(stats) : getUIText("loading", "Loading..."))}</div>
-    <div class="dashcam-upload-progress__actions">
-      <button class="btn dashcam-upload-progress__cancel" type="button">${escapeHtml(options.cancelLabel || getUIText("cancel", "Cancel"))}</button>
-    </div>
-  </div>`;
-  document.body.appendChild(overlay);
-  document.body.classList.add("dialog-open");
-  requestAnimationFrame(() => overlay.classList.add("is-open"));
-  const message = overlay.querySelector(".dashcam-upload-progress__message");
-  const summary = overlay.querySelector(".dashcam-upload-progress__summary");
-  const bar = overlay.querySelector(".dashcam-upload-progress__bar span");
-  const cancelButton = overlay.querySelector(".dashcam-upload-progress__cancel");
-  let closed = false;
-  let cancelHandler = typeof options.onCancel === "function" ? options.onCancel : null;
-  if (cancelButton) {
-    cancelButton.onclick = async () => {
-      if (!cancelHandler || cancelButton.disabled) return;
-      cancelButton.disabled = true;
-      cancelButton.textContent = getUIText("upload_canceling", "Canceling...");
-      try {
-        await cancelHandler();
-      } catch (e) {
-        cancelButton.disabled = false;
-        cancelButton.textContent = options.cancelLabel || getUIText("cancel", "Cancel");
-        showAppToast(e?.message || getUIText("error", "Error"), { tone: "error", duration: 3600 });
-      }
-    };
+const DASHCAM_UPLOAD_PHASE_TEXT = Object.freeze({
+  queued: ["upload_phase_queued", "Waiting to upload"],
+  preparing: ["upload_phase_preparing", "Preparing files"],
+  uploading: ["upload_phase_uploading", "Uploading files"],
+  notifying: ["upload_phase_notifying", "Sending completion notice"],
+  canceling: ["upload_phase_canceling", "Canceling upload"],
+  complete: ["upload_phase_complete", "Upload complete"],
+  canceled: ["upload_phase_canceled", "Upload canceled"],
+  failed: ["upload_phase_failed", "Upload failed"],
+});
+
+function dashcamUploadPhaseLabel(phase, status = "") {
+  let normalized = String(phase || "").trim().toLowerCase();
+  if (!DASHCAM_UPLOAD_PHASE_TEXT[normalized]) {
+    normalized = status === "failed"
+      ? "failed"
+      : status === "canceled"
+        ? "canceled"
+        : status === "done"
+          ? "complete"
+          : "uploading";
+  }
+  const [key, fallback] = DASHCAM_UPLOAD_PHASE_TEXT[normalized];
+  return getUIText(key, fallback);
+}
+
+function dashcamUploadProgressView(snapshot = {}, totalFallback = 0, stats = null, stateOverride = null) {
+  const current = Math.max(0, Number(snapshot.step_current || 0));
+  const total = Math.max(0, Number(snapshot.step_total || totalFallback || 0));
+  const phase = String(snapshot.phase || "preparing").trim().toLowerCase();
+  const progressState = stateOverride || dashcamUploadProgressState(snapshot);
+  const showSegmentCount = total > 0 && (phase === "queued" || phase === "preparing" || phase === "uploading");
+  const segmentLabel = showSegmentCount
+    ? getUIText("upload_segment_progress", "Segments {current}/{total}", { current, total })
+    : "";
+  const message = [
+    dashcamUploadPhaseLabel(phase, snapshot.status),
+    segmentLabel,
+  ].filter(Boolean).join(" · ");
+  const bytesCurrent = Math.max(0, Number(snapshot.bytes_current || 0));
+  const bytesTotal = Math.max(0, Number(snapshot.bytes_total || stats?.bytes || 0));
+  const bytesPerSecond = Math.max(0, Number(snapshot.bytes_per_second || 0));
+  const isPreparing = phase === "queued" || phase === "preparing";
+  let summary = stats ? dashcamUploadSummaryLabel(stats) : getUIText("loading", "Loading...");
+  if (!isPreparing && bytesTotal > 0) {
+    summary = `${formatLogBytes(Math.min(bytesCurrent, bytesTotal))} / ${formatLogBytes(bytesTotal)}`;
+    if (bytesPerSecond > 0) summary += ` · ${formatLogBytes(bytesPerSecond)}/s`;
   }
   return {
-    setCancelHandler(handler) {
-      cancelHandler = typeof handler === "function" ? handler : null;
-      if (cancelButton) cancelButton.hidden = !cancelHandler;
-    },
-    setCanceling(active) {
-      if (!cancelButton) return;
-      cancelButton.disabled = Boolean(active);
-      cancelButton.textContent = active
-        ? getUIText("upload_canceling", "Canceling...")
-        : (options.cancelLabel || getUIText("cancel", "Cancel"));
-    },
-    setMessage(text) {
-      if (message) message.textContent = text || "";
-    },
-    setProgress(percent) {
-      if (!bar) return;
-      const value = Number(percent);
-      if (!Number.isFinite(value) || value <= 0) {
-        bar.style.animation = "";
-        bar.style.transform = "";
-        bar.style.width = "";
-        return;
-      }
-      bar.style.animation = "none";
-      bar.style.transform = "none";
-      bar.style.width = `${Math.max(4, Math.min(100, value))}%`;
+    message,
+    progressState,
+    summary,
+  };
+}
+
+function openDashcamUploadProgress(total, stats = null, options = {}) {
+  const openedAt = Date.now();
+  const model = createDashcamUploadProgressModel();
+  const initialSnapshot = {
+    phase: "queued",
+    step_current: 0,
+    step_total: total,
+    progress: 0,
+  };
+  const initialState = model.update(initialSnapshot);
+  const initial = dashcamUploadProgressView(
+    initialSnapshot,
+    total,
+    stats,
+    initialState.progressState,
+  );
+  const dialog = openAppProgressDialog({
+    title: getUIText("log_uploading", "Uploading logs"),
+    message: initial.message,
+    progressState: initial.progressState,
+    progressLabel: getUIText("upload_progress_label", "Upload progress"),
+    summary: initial.summary,
+    cancelLabel: options.cancelLabel || getUIText("cancel", "Cancel"),
+    cancelingLabel: getUIText("upload_canceling", "Canceling..."),
+    onCancel: options.onCancel,
+  });
+  return Object.freeze({
+    completion: dialog.completion,
+    setCancelHandler: dialog.setCancelHandler,
+    setCanceling: dialog.setCanceling,
+    setMessage: dialog.setMessage,
+    setProgressState: dialog.setProgressState,
+    update(snapshot, totalFallback = total) {
+      const modelState = model.update(snapshot);
+      if (!modelState.accepted) return;
+      const view = dashcamUploadProgressView(
+        snapshot,
+        totalFallback,
+        stats,
+        modelState.progressState,
+      );
+      dialog.setMessage(view.message);
+      dialog.setProgressState(view.progressState);
+      dialog.setSummary(view.summary);
     },
     setSummary(nextStats) {
-      if (summary) summary.textContent = nextStats ? dashcamUploadSummaryLabel(nextStats) : "";
+      const summary = typeof nextStats === "string"
+        ? nextStats
+        : nextStats
+          ? dashcamUploadSummaryLabel(nextStats)
+          : "";
+      dialog.setSummary(summary);
     },
-    close() {
-      if (closed) return;
-      closed = true;
-      overlay.classList.remove("is-open");
-      window.setTimeout(() => {
-        overlay.remove();
-        syncModalBodyLock();
-      }, 160);
+    async settle() {
+      const remaining = DASHCAM_UPLOAD_PROGRESS_MIN_VISIBLE_MS - (Date.now() - openedAt);
+      if (remaining > 0) await waitMs(remaining);
+      await waitMs(DASHCAM_UPLOAD_PROGRESS_FINISH_HOLD_MS);
     },
-  };
+    close: dialog.close,
+  });
 }
 
 function rememberDashcamUploadJob(jobId) {
@@ -1258,24 +1504,16 @@ function getRememberedDashcamUploadJob() {
   }
 }
 
-async function pollDashcamUploadJob(jobId, progress, totalFallback = 0, options = {}) {
+async function pollDashcamUploadJob(jobId, progress, totalFallback = 0) {
   let snapshot = null;
   while (jobId) {
-    if (typeof options.isCanceled === "function" && options.isCanceled()) {
-      throw makeDashcamUploadCanceledError();
-    }
     snapshot = await getJson(`/api/dashcam/upload/job?id=${encodeURIComponent(jobId)}`);
-    const current = Number(snapshot.step_current || 0);
-    const total = Number(snapshot.step_total || totalFallback || 0);
-    const percent = Number(snapshot.progress);
-    const message = snapshot.message || getUIText("log_uploading", "Uploading logs");
-    progress.setMessage(`${current}/${total || totalFallback || 0} · ${message}`);
-    progress.setProgress(percent);
+    progress.update(snapshot, totalFallback);
     if (snapshot.status === "canceled" || snapshot.result?.canceled) {
       throw makeDashcamUploadCanceledError();
     }
     if (snapshot.done) break;
-    await waitMs(850);
+    await waitMs(DASHCAM_UPLOAD_POLL_INTERVAL_MS);
   }
 
   const result = snapshot?.result || {};
@@ -1286,10 +1524,11 @@ async function pollDashcamUploadJob(jobId, progress, totalFallback = 0, options 
   return result;
 }
 
-async function resumeDashcamUploadJobIfNeeded() {
+async function resumeDashcamUploadJobIfNeeded(options = {}) {
   if (dashcamUploadResumePromise) return dashcamUploadResumePromise;
   const jobId = getRememberedDashcamUploadJob();
-  if (!jobId || jobId === dashcamUploadActiveJobId) return null;
+  const force = options.force === true;
+  if (!jobId || (!force && jobId === dashcamUploadActiveJobId)) return null;
 
   dashcamUploadResumePromise = (async () => {
     let snapshot = null;
@@ -1314,11 +1553,8 @@ async function resumeDashcamUploadJobIfNeeded() {
     const progress = openDashcamUploadProgress(total, null, {
       onCancel: async () => {
         cancelRequested = true;
-        progress.setCanceling(true);
-        await cancelDashcamUploadJob(jobId);
-        clearRememberedDashcamUploadJob(jobId);
-        progress.close();
-        showAppToast(getUIText("upload_canceled", "Upload canceled"), { duration: 2600 });
+        const cancelSnapshot = await cancelDashcamUploadJob(jobId);
+        progress.update(cancelSnapshot, total);
       },
     });
     let activityId = typeof beginAppActivity === "function"
@@ -1326,18 +1562,26 @@ async function resumeDashcamUploadJobIfNeeded() {
       : null;
 
     try {
-      progress.setMessage(`${Number(snapshot.step_current || 0)}/${total} · ${snapshot.message || getUIText("log_uploading", "Uploading logs")}`);
-      progress.setProgress(Number(snapshot.progress));
-      const result = await pollDashcamUploadJob(jobId, progress, total, { isCanceled: () => cancelRequested });
+      progress.update(snapshot, total);
+      const result = await pollDashcamUploadJob(jobId, progress, total);
       clearRememberedDashcamUploadJob(jobId);
-      progress.setMessage(`${Number(result.uploaded || 0)}/${Number(result.total || total)}`);
-      progress.setProgress(100);
-      progress.setSummary(dashcamUploadStats(result.results || []));
-      showAppToast(result.message || getUIText("upload_complete_count", "Upload complete {uploaded}/{total}", {
+      const resultStats = dashcamUploadStats(result.results || []);
+      progress.update({
+        phase: result.ok ? "complete" : "failed",
+        status: result.ok ? "done" : "failed",
+        step_current: Number(result.uploaded || 0),
+        step_total: Number(result.total || total),
+        progress: result.ok ? 100 : null,
+        bytes_current: resultStats.bytes,
+        bytes_total: resultStats.bytes,
+      }, total);
+      progress.setSummary(resultStats);
+      await progress.settle();
+      showAppToast(getUIText("upload_complete_count", "Upload complete {uploaded}/{total}", {
         uploaded: result.uploaded || 0,
         total: result.total || total,
       }), { tone: result.ok ? "default" : "error", duration: 3600 });
-      progress.close();
+      await progress.close();
       if (activityId && typeof endAppActivity === "function") {
         endAppActivity(activityId);
         activityId = null;
@@ -1348,7 +1592,7 @@ async function resumeDashcamUploadJobIfNeeded() {
       progress.close();
       clearRememberedDashcamUploadJob(jobId);
       if (isDashcamUploadCanceledError(e)) {
-        if (!cancelRequested) showAppToast(getUIText("upload_canceled", "Upload canceled"), { duration: 2600 });
+        showAppToast(getUIText("upload_canceled", "Upload canceled"), { duration: 2600 });
       } else {
         showAppToast(`${getUIText("log_upload", "Upload Logs")} ${getUIText("error", "Error")}: ${e.message || e}`, { tone: "error", duration: 4200 });
       }
@@ -1364,9 +1608,11 @@ async function resumeDashcamUploadJobIfNeeded() {
 }
 
 async function uploadDashcamSegments(segments, options = {}) {
-  const existingJobId = dashcamUploadActiveJobId || getRememberedDashcamUploadJob();
-  if (existingJobId) {
+  if (dashcamUploadActiveJobId) {
     showAppToast(getUIText("upload_already_running", "Upload already running."), { tone: "error", duration: 3200 });
+    return;
+  }
+  if (getRememberedDashcamUploadJob()) {
     resumeDashcamUploadJobIfNeeded().catch(() => {});
     return;
   }
@@ -1376,27 +1622,49 @@ async function uploadDashcamSegments(segments, options = {}) {
     showAppToast(getUIText("no_selected_segments", "No segments selected."), { tone: "error" });
     return;
   }
-  let uploadStats = { segments: targets.length, files: 0, bytes: 0 };
+  let uploadStats = {
+    segments: targets.length,
+    segmentNames: targets,
+    files: 0,
+    qcamera: 0,
+    rlog: 0,
+    bytes: 0,
+  };
   if (options.confirm !== false) {
     try {
       const summary = await postJson("/api/dashcam/upload/summary", { segments: targets });
-      if (Array.isArray(summary?.summaries)) uploadStats = dashcamUploadStats(summary.summaries);
-    } catch {}
-    const confirmMessage = [
-      getUIText("log_upload_confirm", `Upload ${targets.length} logs to the Carrot server?`, { count: targets.length }),
-      dashcamUploadSummaryLabel(uploadStats),
-      getUIText("upload_data_warning", "This upload may use mobile data depending on your network connection."),
-    ].join("\n\n");
-    const ok = await appConfirm(confirmMessage, { title: getUIText("log_upload", "Upload Logs") });
+      if (!Array.isArray(summary?.summaries) || summary.summaries.length !== targets.length) {
+        throw new Error(getUIText("upload_summary_unavailable", "Upload information is unavailable."));
+      }
+      uploadStats = dashcamUploadStats(summary.summaries);
+    } catch (error) {
+      showAppToast(`${getUIText("log_upload", "Upload Logs")} ${getUIText("error", "Error")}: ${error?.message || error}`, {
+        tone: "error",
+        duration: 4200,
+      });
+      return;
+    }
+    const ok = await appConfirm("", {
+      title: getUIText("log_upload", "Upload Logs"),
+      html: true,
+      messageHtml: dashcamUploadConfirmHtml(uploadStats),
+      confirmLabel: getUIText("upload_send", "Send"),
+    });
     if (!ok) return;
   }
   const silentProgress = {
     setCancelHandler() {},
     setCanceling() {},
     setMessage() {},
-    setProgress() {},
+    setProgressState() {},
+    update() {},
     setSummary() {},
-    close() {},
+    settle() {
+      return Promise.resolve();
+    },
+    close() {
+      return Promise.resolve();
+    },
   };
   let cancelRequested = false;
   const progress = options.showProgress === false
@@ -1404,11 +1672,17 @@ async function uploadDashcamSegments(segments, options = {}) {
     : openDashcamUploadProgress(targets.length, uploadStats, {
       onCancel: async () => {
         cancelRequested = true;
-        progress.setCanceling(true);
-        if (jobId) await cancelDashcamUploadJob(jobId);
-        clearRememberedDashcamUploadJob(jobId);
-        progress.close();
-        showAppToast(getUIText("upload_canceled", "Upload canceled"), { duration: 2600 });
+        if (jobId) {
+          const cancelSnapshot = await cancelDashcamUploadJob(jobId);
+          progress.update(cancelSnapshot, targets.length);
+        } else {
+          progress.update({
+            phase: "canceling",
+            step_current: 0,
+            step_total: targets.length,
+            progress: null,
+          }, targets.length);
+        }
       },
     });
   let activityId = options.showProgress !== false && typeof beginAppActivity === "function"
@@ -1416,7 +1690,12 @@ async function uploadDashcamSegments(segments, options = {}) {
     : null;
   let jobId = null;
   try {
-    progress.setMessage(`0/${targets.length} · ${getUIText("log_uploading", "Uploading logs")}`);
+    progress.update({
+      phase: "preparing",
+      step_current: 0,
+      step_total: targets.length,
+      progress: null,
+    }, targets.length);
     if (cancelRequested) throw makeDashcamUploadCanceledError();
     const started = await postJson("/api/dashcam/upload/start", { segments: targets });
     jobId = started.job_id;
@@ -1425,20 +1704,31 @@ async function uploadDashcamSegments(segments, options = {}) {
       await cancelDashcamUploadJob(jobId);
       throw makeDashcamUploadCanceledError();
     }
-    const result = await pollDashcamUploadJob(jobId, progress, targets.length, { isCanceled: () => cancelRequested });
+    const result = await pollDashcamUploadJob(jobId, progress, targets.length);
     clearRememberedDashcamUploadJob(jobId);
-    progress.setMessage(`${Number(result.uploaded || 0)}/${Number(result.total || targets.length)}`);
-    progress.setProgress(100);
-    progress.setSummary(dashcamUploadStats(result.results || []));
-    const message = result.message || getUIText("upload_complete_count", "Upload complete {uploaded}/{total}", {
+    const resultStats = dashcamUploadStats(result.results || []);
+    progress.update({
+      phase: result.ok ? "complete" : "failed",
+      status: result.ok ? "done" : "failed",
+      step_current: Number(result.uploaded || 0),
+      step_total: Number(result.total || targets.length),
+      progress: result.ok ? 100 : null,
+      bytes_current: resultStats.bytes,
+      bytes_total: resultStats.bytes,
+    }, targets.length);
+    progress.setSummary(resultStats);
+    await progress.settle();
+    const message = getUIText("upload_complete_count", "Upload complete {uploaded}/{total}", {
       uploaded: result.uploaded || 0,
       total: result.total || targets.length,
     });
-    showAppToast(message, {
-      tone: result.ok ? "default" : "error",
-      duration: Number(options.toastDuration) || 3600,
-    });
-    progress.close();
+    if (options.showSuccessToast !== false) {
+      showAppToast(message, {
+        tone: result.ok ? "default" : "error",
+        duration: Number(options.toastDuration) || 3600,
+      });
+    }
+    await progress.close();
     if (activityId && typeof endAppActivity === "function") {
       endAppActivity(activityId);
       activityId = null;
@@ -1451,9 +1741,9 @@ async function uploadDashcamSegments(segments, options = {}) {
     if (runningJobId) {
       rememberDashcamUploadJob(runningJobId);
       showAppToast(getUIText("upload_already_running", "Upload already running"), { tone: "error", duration: 3200 });
-      resumeDashcamUploadJobIfNeeded().catch(() => {});
+      resumeDashcamUploadJobIfNeeded({ force: true }).catch(() => {});
     } else if (isDashcamUploadCanceledError(e)) {
-      if (!cancelRequested) showAppToast(getUIText("upload_canceled", "Upload canceled"), { duration: 2600 });
+      showAppToast(getUIText("upload_canceled", "Upload canceled"), { duration: 2600 });
     } else {
       showAppToast(`${getUIText("log_upload", "Upload Logs")} ${getUIText("error", "Error")}: ${e.message || e}`, {
         tone: "error",
@@ -1631,12 +1921,9 @@ async function showDashcamRangeSelect(route) {
 
 async function setDashcamSort(next) {
   const dir = next === "desc" ? "desc" : "asc";
-  if (dashcamState.sort === dir) {
-    if (typeof syncLogsMenu === "function") syncLogsMenu();
-    return;
-  }
+  // No menu state to refresh: the logs menu reads the direction when it opens.
+  if (dashcamState.sort === dir) return;
   dashcamState.sort = dir;
-  if (typeof syncLogsMenu === "function") syncLogsMenu();
   try {
     localStorage.setItem(DASHCAM_SORT_STORAGE_KEY, dir);
   } catch {}
@@ -1737,203 +2024,19 @@ async function showDashcamRouteMenu(route) {
     message: dashcamRouteTitle(route),
     choiceLayout: "list",
     choices: [
+      { label: getUIText("route_summary", "주행요약"), value: "summary" },
       { label: `${getUIText("select_range", "Select range")}…`, value: "range" },
     ],
   });
-  if (selected === "range") await showDashcamRangeSelect(route);
-}
-
-const DASHCAM_REPORT_CAUSE_LABELS = {
-  brake: ["report_cause_brake", "브레이크"],
-  gas: ["report_cause_gas", "가속페달"],
-  button: ["report_cause_button", "버튼취소"],
-  steer: ["report_cause_steer", "조향"],
-  other: ["report_cause_other", "기타"],
-};
-
-function dashcamReportEventTimes(obj) {
-  const items = obj?.items || [];
-  if (!items.length) return "";
-  const shown = items.map((it) => {
-    const peak = (it.peak != null) ? ` <em>${escapeHtml(String(it.peak))}</em>` : "";
-    return `<span class="drpt-chip">${escapeHtml(it.clock || "-")}${peak}</span>`;
-  }).join("");
-  const more = (obj.count > items.length)
-    ? `<span class="drpt-chip drpt-chip--more">＋${obj.count - items.length}</span>`
-    : "";
-  return `<div class="drpt-chips">${shown}${more}</div>`;
-}
-
-function dashcamReportEventRow(labelKey, fallback, obj, cls) {
-  const count = obj?.count || 0;
-  const label = escapeHtml(getUIText(labelKey, fallback));
-  const unit = escapeHtml(getUIText("report_unit_times", "회"));
-  return `<div class="drpt-evt ${cls}">
-    <div class="drpt-evt-head"><span class="drpt-evt-label">${label}</span><span class="drpt-evt-count">${count}${unit}</span></div>
-    ${count ? dashcamReportEventTimes(obj) : ""}
-  </div>`;
-}
-
-// 주행시간 구성비율 막대바 색상 (라벨/시간 글자색과 동일 계열).
-const DASHCAM_REPORT_BAR = {
-  autoFill: "#7dd3fc", autoStroke: "#3b82f6",   // 자동: 하늘색 채우기 / 파란 테두리
-  manualStroke: "#ff5a5a",                       // 수동 그룹: 빨간 테두리
-  gasFill: "#ffd54a",                            // 수동 Gas: 노란색
-  brakeFill: "#ff8c1a",                          // 수동 Brake: 주황색
-  otherFill: "rgba(255,90,90,0.35)",             // 수동 기타(코스팅)
-};
-
-// 자동/수동(Gas·Brake·기타) 구성비를 가로 스택 막대로. 가로(landscape)에서 배너
-// 전체 폭(100%)을 쓰는 별도 줄로 표시된다.
-function dashcamReportBar(t) {
-  const auto = Math.max(0, Number(t.autoSec) || 0);
-  const manual = Math.max(0, Number(t.manualSec) || 0);
-  let gas = Math.max(0, Number(t.manualGasSec) || 0);
-  let brake = Math.max(0, Number(t.manualBrakeSec) || 0);
-  const barTotal = auto + manual;
-  if (barTotal <= 0) return "";
-  if (gas + brake > manual && gas + brake > 0) { const s = manual / (gas + brake); gas *= s; brake *= s; }
-  const other = Math.max(0, manual - gas - brake);
-  const C = DASHCAM_REPORT_BAR;
-
-  const autoSeg = auto > 0
-    ? `<div class="drpt-bar-seg drpt-bar-seg--auto" style="flex:${auto} 1 0%;background:${C.autoFill};border-color:${C.autoStroke}"></div>`
-    : "";
-  const manualSegs = [
-    gas > 0 ? `<div class="drpt-bar-seg drpt-bar-seg--gas" style="flex:${gas} 1 0%;background:${C.gasFill}"></div>` : "",
-    brake > 0 ? `<div class="drpt-bar-seg drpt-bar-seg--brake" style="flex:${brake} 1 0%;background:${C.brakeFill}"></div>` : "",
-    other > 0 ? `<div class="drpt-bar-seg drpt-bar-seg--other" style="flex:${other} 1 0%;background:${C.otherFill}"></div>` : "",
-  ].join("");
-  const manualGroup = manual > 0
-    ? `<div class="drpt-bar-group" style="flex:${manual} 1 0%;border-color:${C.manualStroke}">${manualSegs}</div>`
-    : "";
-
-  return `<div class="drpt-bar-wrap"><div class="drpt-bar">${autoSeg}${manualGroup}</div></div>`;
-}
-
-function dashcamReportHtml(rep) {
-  if (!rep || !rep.ok) {
-    return `<div class="drpt-empty">${escapeHtml(getUIText("report_failed", "리포트를 불러오지 못했습니다."))}</div>`;
-  }
-  const t = rep.time || {};
-  const d = rep.distance || {};
-  const ev = rep.events || {};
-  const ex = rep.extras || {};
-  const u = (k, f) => escapeHtml(getUIText(k, f));
-
-  if (!rep.hasData) {
-    return `<div class="drpt-empty">${u("report_no_data", "이 주행에는 분석할 로그 데이터가 없습니다.")}</div>`;
-  }
-
-  const causes = ex.disengageCauses || {};
-  const causeSummary = Object.keys(DASHCAM_REPORT_CAUSE_LABELS)
-    .filter((k) => causes[k])
-    .map((k) => `${u(DASHCAM_REPORT_CAUSE_LABELS[k][0], DASHCAM_REPORT_CAUSE_LABELS[k][1])} ${causes[k]}`)
-    .join(" · ");
-
-  const disengageTimes = (ex.disengageItems || []).length
-    ? `<div class="drpt-chips">${ex.disengageItems.map((it) => {
-        const c = DASHCAM_REPORT_CAUSE_LABELS[it.cause] || ["report_cause_other", it.cause];
-        return `<span class="drpt-chip">${escapeHtml(it.clock || "-")} <em>${u(c[0], c[1])}</em></span>`;
-      }).join("")}</div>`
-    : "";
-
-  const warn = ex.warnCounts || {};
-  const unitT = u("report_unit_times", "회");
-
-  return `<div class="drpt">
-    <section class="drpt-sec">
-      <h4 class="drpt-h">${u("report_sec_time", "주행 시간")}</h4>
-      <div class="drpt-total">
-        <span class="drpt-total-val">${escapeHtml(t.totalHms || "00:00:00")}</span>
-        <span class="drpt-total-sub">${escapeHtml(t.startClock || "-")} ~ ${escapeHtml(t.endClock || "-")}</span>
-      </div>
-      <div class="drpt-tdetail">
-        <div class="drpt-tgrp drpt-tgrp--auto">
-          <div class="drpt-kv drpt-kv--c-auto"><span>${u("report_auto", "자동 주행")}</span><b>${escapeHtml(t.autoEnabledHms || "-")} (${escapeHtml(String(t.autoRatioPct ?? 0))}%)</b></div>
-        </div>
-        <div class="drpt-tgrp drpt-tgrp--manual">
-          <div class="drpt-kv drpt-kv--c-manual"><span>${u("report_manual", "수동 주행")}</span><b>${escapeHtml(t.manualHms || "-")} (${escapeHtml(String(t.manualRatioPct ?? 0))}%)</b></div>
-          <div class="drpt-kv drpt-kv--sub drpt-kv--c-gas"><span>${u("report_manual_gas", "수동 Gas")}</span><b>${escapeHtml(t.manualGasMs || "-")}</b></div>
-          <div class="drpt-kv drpt-kv--sub drpt-kv--c-brake"><span>${u("report_manual_brake", "수동 Brake")}</span><b>${escapeHtml(t.manualBrakeMs || "-")}</b></div>
-        </div>
-      </div>
-      ${dashcamReportBar(t)}
-    </section>
-
-    <section class="drpt-sec">
-      <h4 class="drpt-h">${u("report_sec_dist", "주행 거리 / 속도")}</h4>
-      <div class="drpt-grid drpt-grid--dist">
-        <div><small>${u("report_dist_total", "총 거리")}</small><b>${escapeHtml(String(d.totalKm ?? 0))} km</b></div>
-        <div><small>${u("report_dist_auto", "자동")}</small><b>${escapeHtml(String(d.autoKm ?? 0))} km</b></div>
-        <div><small>${u("report_dist_manual", "수동")}</small><b>${escapeHtml(String(d.manualKm ?? 0))} km</b></div>
-      </div>
-      <div class="drpt-grid drpt-grid--spd">
-        <div><small>${u("report_speed_avg", "평균")}</small><b>${escapeHtml(String(d.avgSpeedKmh ?? 0))} km/h</b></div>
-        <div><small>${u("report_speed_max", "최고")}</small><b>${escapeHtml(String(d.maxSpeedKmh ?? 0))} km/h</b></div>
-      </div>
-    </section>
-
-    <section class="drpt-sec">
-      <h4 class="drpt-h">${u("report_sec_events", "특이 사항 (급/과 가감속)")}</h4>
-      ${dashcamReportEventRow("report_hard_accel", "급가속", ev.hardAccel, "is-hard is-accel")}
-      ${dashcamReportEventRow("report_over_accel", "과가속", ev.overAccel, "is-over is-accel")}
-      ${dashcamReportEventRow("report_hard_decel", "급감속", ev.hardDecel, "is-hard is-decel")}
-      ${dashcamReportEventRow("report_over_decel", "과감속", ev.overDecel, "is-over is-decel")}
-    </section>
-
-    <section class="drpt-sec">
-      <h4 class="drpt-h">${u("report_sec_extra", "추가 지표")}</h4>
-      <div class="drpt-evt">
-        <div class="drpt-evt-head"><span class="drpt-evt-label">${u("report_disengage", "자동→수동 개입")}</span><span class="drpt-evt-count">${ex.disengageCount || 0}${unitT}</span></div>
-        ${causeSummary ? `<div class="drpt-sub2">${escapeHtml(causeSummary)}</div>` : ""}
-        ${disengageTimes}
-      </div>
-      <div class="drpt-kv"><span>${u("report_stops", "정차")}</span><b>${ex.stopCount || 0}${unitT}</b><small>${u("report_stop_time", "총 정차")} ${escapeHtml(t.stopMs || "-")}</small></div>
-      <div class="drpt-kv"><span>${u("report_steer_ovr", "자동 중 조향개입")}</span><b>${ex.steerOverrideCount || 0}${unitT}</b><small>${escapeHtml(t.steerOverrideMs || "-")}</small></div>
-      <div class="drpt-kv"><span>${u("report_corner", "하드코너링")}</span><b>${ex.cornerCount || 0}${unitT}</b><small>${u("report_max_lat", "최대횡가속")} ${escapeHtml(String(ex.maxLatAccel ?? 0))} m/s²</small></div>
-      <div class="drpt-kv"><span>${u("report_warns", "경고")}</span><b></b><small>FCW ${warn.fcw || 0} · LDW ${warn.ldw || 0} · ${u("report_warn_dm", "주시태만")} ${warn.driverDistracted || 0}</small></div>
-    </section>
-
-    <div class="drpt-foot">${u("report_source", "분석 소스")}: ${escapeHtml((rep.source || "-").toUpperCase())} · ${escapeHtml(String(rep.segments || 0))} ${u("report_segments", "세그먼트")}</div>
-  </div>`;
-}
-
-async function showDashcamRouteReport(route) {
-  if (!route) return;
-  const title = `${getUIText("route_report", "주행 리포트")} · ${dashcamRouteTitle(route)}`;
-  openAppDialog({
-    mode: "alert",
-    html: true,
-    title,
-    messageHtml: `<div class="drpt-loading">${escapeHtml(getUIText("report_analyzing", "로그 분석 중… (주행 길이에 따라 수십 초 소요될 수 있음)"))}</div>`,
-    confirmLabel: getUIText("cancel", "취소"),
-  });
-  let rep;
-  try {
-    rep = await getJson(`/api/dashcam/report/${encodeURIComponent(route)}`);
-  } catch (e) {
-    openAppDialog({
-      mode: "alert",
-      title,
-      message: `${getUIText("report_failed", "리포트를 불러오지 못했습니다.")}${e?.message ? ` (${e.message})` : ""}`,
-      confirmLabel: getUIText("close", "닫기"),
-    });
-    return;
-  }
-  openAppDialog({
-    mode: "alert",
-    html: true,
-    title,
-    messageHtml: dashcamReportHtml(rep),
-    confirmLabel: getUIText("close", "닫기"),
-  });
+  if (selected === "summary") await openRouteSummary(route);
+  else if (selected === "range") await showDashcamRangeSelect(route);
 }
 
 export {
   cancelDashcamRouteRender,
   dashcamDefaultRouteHeight,
   dashcamLayoutKey,
+  loadDashcamReadState,
   dashcamSelectedForRoute,
   dashcamSortDirection,
   dashcamState,
@@ -1950,7 +2053,6 @@ export {
   setDashcamLoadingMoreUi,
   setDashcamSort,
   showDashcamRouteMenu,
-  showDashcamRouteReport,
   showDashcamSegmentMenu,
   startDashcamAutoRefresh,
   toggleDashcamRouteSelectAll,

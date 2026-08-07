@@ -15,6 +15,8 @@ Carrot Web is a local web interface for viewing and managing carrotpilot from a 
 
 Example: `http://192.168.0.25:7000`
 
+Select the white carrot icon on the device to show a large QR code for its current address. On C3, use the bottom-left button; on C4, use the bottom status-icon row. Scan it with a phone on the same network to connect. If the device IP changes while the QR screen is open, both the QR code and displayed address update automatically. Long addresses scale to fit instead of being shortened. The last QR refresh time appears below the address as numeric `HH:MM:SS`, with the 30-second auto-close countdown on the right. Tap the QR screen to close it, or leave it open and it closes when the countdown reaches zero.
+
 Carrot Web is a local device-management interface. Do not expose it directly to the internet or give its address, a remote-support link, or terminal access to an untrusted person.
 
 ## Pages at a glance
@@ -44,6 +46,12 @@ The Drive page displays live video and driving state. Its usual layout contains 
 - A parked device or unavailable camera/driving data produces a waiting state instead of live video.
 
 The web video and HUD are reference displays. Always prioritize the vehicle's actual warnings and the road ahead.
+
+### AR display and diagnostics
+
+- Enabling **Show AR** in `Tools > Web Settings` overlays Carrot Navi driving guidance on the Carrot Vision video and requests additional real-time pose and position data only while it is enabled.
+- **AR debug** shows sign, anchor, and draw counts plus the current blocking reason, and can copy or save its diagnostic history.
+- The replay event timeline distinguishes recorded Carrot Navi connection changes, current and next maneuvers, lane guidance, road-safety alerts, average-speed zones, traffic signals, and intersection guidance.
 
 ### Layout
 
@@ -81,7 +89,7 @@ The Settings page is divided into `Device` and `carrotpilot` tabs.
 - Search by setting name or description.
 - Long-press a setting to add or remove it from Favorites.
 - Profiles save a group of values and allow selected values to be applied later.
-- A setting detail page can show popular values, recent change history, and the code-owned detailed guide.
+- A setting detail page can show popular values, recent change history, and a verified Wiki guide.
 - Risky settings display a warning, and some settings take effect only after reboot.
 - Resetting defaults changes many values; make a backup first.
 
